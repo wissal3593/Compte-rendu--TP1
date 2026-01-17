@@ -1,0 +1,386 @@
+name: Autograding Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+permissions:
+  checks: write
+  actions: read
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_APP_PATH: "application"
+  README_PATH: "."
+
+jobs:
+  run-autograding-tests:
+    name: Autograding
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      ${{ !github.event.repository.is_template
+          && github.actor != 'github-classroom[bot]' }}
+    steps:
+      # Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      # Repository checks
+      # 1 - Check if the application folder contains an Android project
+      - name: Auto-detect Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Search for gradlew which indicates the root of an Android project
+          GRADLEW_PATH=$(find ${{env.ANDROID_APP_PATH}} -name "gradlew" -type f | head -n 1)
+
+          if [ -z "$GRADLEW_PATH" ]; then
+            echo "No Android project (gradlew) found under application/"
+            exit 1
+          fi
+
+          # Extract the directory containing gradlew
+          DETECTED_PATH=$(dirname "$GRADLEW_PATH")
+          echo "Android project detected at: $DETECTED_PATH"
+
+          # Override the ANDROID_APP_PATH environment variable
+          echo "ANDROID_APP_PATH=$DETECTED_PATH" >> $GITHUB_ENV
+        continue-on-error: true
+
+      # 2 - Check for README.md
+      - name: Check for README.md
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "${{env.README_PATH}}/README.md" ]; then
+              echo "README.md found"
+          else
+              echo "No README.md found"
+              exit 1
+          fi
+        continue-on-error: true
+
+      # To use with instrumentation tests
+      # - name: Delete unnecessary tools 🔧
+      #   uses: jlumbroso/free-disk-space@v1.3.1
+      #   with:
+      #     android: false # Don't remove Android tools
+      #     tool-cache: true # Remove image tool cache
+      #     dotnet: true
+      #     haskell: true
+      #     swap-storage: true
+
+      # To use with instrumentation tests
+      # Enable KVM for emulator
+      - name: Enable KVM
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Make all scripts executable
+        run: |
+          find .github/scripts -type f -name "*.sh" -exec chmod +x {} \;
+          chmod +x ${{env.ANDROID_APP_PATH}}/gradlew
+        continue-on-error: true
+
+      - name: Copy CI gradle.properties
+        run: mkdir -p ~/.gradle ; cp .github/ci-gradle.properties ~/.gradle/gradle.properties
+
+      - name: "Read Java Info"
+        id: "java_info"
+        uses: YunaBraska/java-info-action@main
+        with:
+          work-dir: ${{env.ANDROID_APP_PATH}}
+          jv-fallback: 17
+        continue-on-error: true
+
+      # Determine compatible Java version based on Gradle version
+      - name: Determine Java version for Gradle compatibility
+        id: java_version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GRADLE_VERSION="${{ steps.java_info.outputs.builder_version }}"
+          IS_GRADLE="${{ steps.java_info.outputs.is_gradle }}"
+          FALLBACK_JAVA="${{ steps.java_info.outputs.java_version }}"
+
+          echo "Detected Gradle version: $GRADLE_VERSION"
+          echo "Is Gradle project: $IS_GRADLE"
+
+          # Function to compare versions
+          version_ge() {
+            printf '%s\n%s\n' "$2" "$1" | sort -V -C
+          }
+
+          # Determine Java version based on Gradle version
+          if [ "$IS_GRADLE" = "true" ] && [ -n "$GRADLE_VERSION" ]; then
+            if version_ge "$GRADLE_VERSION" "9.1.0"; then
+              JAVA_VERSION="21"  # Gradle 9.1.0+ supports up to Java 25, use LTS 21
+            elif version_ge "$GRADLE_VERSION" "8.14"; then
+              JAVA_VERSION="21"  # Gradle 8.14+ supports up to Java 24, use LTS 21
+            elif version_ge "$GRADLE_VERSION" "8.10"; then
+              JAVA_VERSION="21"  # Gradle 8.10+ supports up to Java 23, use LTS 21
+            elif version_ge "$GRADLE_VERSION" "8.8"; then
+              JAVA_VERSION="21"  # Gradle 8.8+ supports up to Java 22, use LTS 21
+            elif version_ge "$GRADLE_VERSION" "8.5"; then
+              JAVA_VERSION="21"  # Gradle 8.5+ supports Java 21
+            elif version_ge "$GRADLE_VERSION" "8.3"; then
+              JAVA_VERSION="17"  # Gradle 8.3+ supports up to Java 20, use LTS 17
+            elif version_ge "$GRADLE_VERSION" "7.6"; then
+              JAVA_VERSION="17"  # Gradle 7.6+ supports up to Java 19, use LTS 17
+            elif version_ge "$GRADLE_VERSION" "7.3"; then
+              JAVA_VERSION="17"  # Gradle 7.3+ supports Java 17
+            elif version_ge "$GRADLE_VERSION" "7.0"; then
+              JAVA_VERSION="11"  # Gradle 7.0+ supports up to Java 16, use LTS 11
+            elif version_ge "$GRADLE_VERSION" "6.7"; then
+              JAVA_VERSION="11"  # Gradle 6.7+ supports up to Java 15, use LTS 11
+            elif version_ge "$GRADLE_VERSION" "5.0"; then
+              JAVA_VERSION="11"  # Gradle 5.0+ supports Java 11
+            else
+              JAVA_VERSION="8"   # Gradle < 5.0 requires Java 8
+            fi
+            echo "Selected Java version based on Gradle $GRADLE_VERSION: $JAVA_VERSION"
+          else
+            JAVA_VERSION="$FALLBACK_JAVA"
+            echo "Using fallback Java version: $JAVA_VERSION"
+          fi
+
+          echo "java_version=$JAVA_VERSION" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      # Setup min version of Java required by Gradle
+      - name: Set up JDK dynamically
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ steps.java_version.outputs.java_version }}
+          distribution: "temurin"
+        continue-on-error: true
+
+      # Let gradle action handle all cache related to gradle operations
+      - name: Gradle setup/cache
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-read-only: false # Allow write to cache beside default branch
+
+      # - name: Android summary via Gradle (init script)
+      #   id: android_summary
+      #   shell: bash
+      #   env:
+      #     APP_PATH: ${{ env.ANDROID_APP_PATH }}
+      #   run: |
+      #     set -euo pipefail
+      #     cp .github/android-summary.init.gradle "$APP_PATH/"
+
+      #     "$APP_PATH/gradlew" -p "$APP_PATH" -q --console=plain \
+      #       -I "android-summary.init.gradle" \
+      #       -Dandroid.summary.out="$PWD/android-summary.json" \
+      #       printAndroidSummary --no-configuration-cache
+
+      #     # Extract first application module values as individual outputs
+      #     min_sdk=$(jq -r '.modules[] | select(.type=="application") | .min_sdk' android-summary.json | head -n1)
+      #     target_sdk=$(jq -r '.modules[] | select(.type=="application") | .target_sdk' android-summary.json | head -n1)
+      #     compile_sdk=$(jq -r '.modules[] | select(.type=="application") | .compile_sdk' android-summary.json | head -n1)
+      #     package_name=$(jq -r '.modules[] | select(.type=="application") | .package_name' android-summary.json | head -n1)
+      #     version_name=$(jq -r '.modules[] | select(.type=="application") | .version_name' android-summary.json | head -n1)
+      #     version_code=$(jq -r '.modules[] | select(.type=="application") | .version_code' android-summary.json | head -n1)
+      #     language=$(jq -r '.modules[] | select(.type=="application") | .language' android-summary.json | head -n1)
+
+      #     {
+      #       echo "min_sdk=$min_sdk"
+      #       echo "target_sdk=$target_sdk"
+      #       echo "compile_sdk=$compile_sdk"
+      #       echo "package_name=$package_name"
+      #       echo "version_name=$version_name"
+      #       echo "version_code=$version_code"
+      #       echo "language=$language"
+      #     } >> "$GITHUB_OUTPUT"
+
+      # - name: Android project summary
+      #   if: always()
+      #   run: |
+      #     {
+      #       echo "## Android Project Summary"
+      #       echo
+      #       echo "**Package:** ${{ steps.android_summary.outputs.package_name }}"
+      #       echo "- minSdk: ${{ steps.android_summary.outputs.min_sdk }}"
+      #       echo "- targetSdk: ${{ steps.android_summary.outputs.target_sdk }}"
+      #       echo "- compileSdk: ${{ steps.android_summary.outputs.compile_sdk }}"
+      #       echo "- versionName: ${{ steps.android_summary.outputs.version_name }}"
+      #       echo "- versionCode: ${{ steps.android_summary.outputs.version_code }}"
+      #       echo "- language: ${{ steps.android_summary.outputs.language }}"
+      #       echo
+      #     } >> "$GITHUB_STEP_SUMMARY"
+
+      # Create env that need to be injected to child process
+      - name: Create file for setting env vars
+        # https://github.com/education/autograding/issues/69#issuecomment-1497674655
+        # https://docs.github.com/en/actions/security-guides/using-secrets-in-github-actions#using-secrets-in-a-workflow
+        # Define ANSWERS_SECRET_PASSPHRASE under your org secrets
+        env:
+          ANSWERS_SECRET_PASSPHRASE: ${{ secrets.ANSWERS_SECRET_PASSPHRASE_WEB }}
+        run: |
+          echo "#!/bin/sh" > setenv.sh
+          echo "export ANSWERS_SECRET_PASSPHRASE=\"$ANSWERS_SECRET_PASSPHRASE\"" >> setenv.sh
+          echo "export README_PATH=\"$README_PATH\"" >> setenv.sh
+          echo "export ANDROID_APP_PATH=\"$ANDROID_APP_PATH\"" >> setenv.sh
+          echo "export ANDROID_HOME=\"$ANDROID_HOME\"" >> setenv.sh
+          echo "export ANDROID_NDK=\"$ANDROID_NDK\"" >> setenv.sh
+          echo "export ANDROID_NDK_HOME=\"$ANDROID_NDK_HOME\"" >> setenv.sh
+          echo "export ANDROID_NDK_LATEST_HOME=\"$ANDROID_NDK_LATEST_HOME\"" >> setenv.sh
+          echo "export ANDROID_NDK_ROOT=\"$ANDROID_NDK_ROOT\"" >> setenv.sh
+          echo "export ANDROID_SDK_ROOT=\"$ANDROID_SDK_ROOT\"" >> setenv.sh
+          chmod +x setenv.sh
+
+      - name: Build Debug
+        id: build-debug
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Build Debug
+          setup-command: ""
+          command: ". ./setenv.sh && ./$ANDROID_APP_PATH/gradlew assembleDebug --no-configuration-cache --stacktrace -p $ANDROID_APP_PATH"
+          timeout: 10
+          max-score: 5
+
+      # Spotless check (formatting) via init script, no student changes required
+      - name: Spotless
+        id: spotless
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Spotless
+          setup-command: ". ./setenv.sh && cp .github/spotless.init.gradle $ANDROID_APP_PATH/"
+          command: ". ./setenv.sh && ./$ANDROID_APP_PATH/gradlew -p $ANDROID_APP_PATH --no-configuration-cache -I spotless.init.gradle spotlessCheck"
+          timeout: 5
+          max-score: 2
+
+      - name: Q1
+        id: q1
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q1
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 1"
+          timeout: 1
+          max-score: 1
+
+      - name: Q2
+        id: q2
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q2
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 2"
+          timeout: 1
+          max-score: 1
+
+      - name: Q3
+        id: q3
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q1
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 3"
+          timeout: 1
+          max-score: 1
+
+      - name: Q4
+        id: q4
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q4
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 4"
+          timeout: 1
+          max-score: 1
+
+      - name: Q5
+        id: q5
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q5
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 5"
+          timeout: 1
+          max-score: 1
+
+      - name: Q6
+        id: q6
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q6
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 6"
+          timeout: 1
+          max-score: 1
+
+      - name: Q7
+        id: q7
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q7
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 7"
+          timeout: 1
+          max-score: 1
+
+      - name: Q8
+        id: q8
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q8
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 8"
+          timeout: 1
+          max-score: 1
+
+      - name: Q9
+        id: q9
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q9
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 9"
+          timeout: 1
+          max-score: 1
+
+      - name: Q10
+        id: q10
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Q10
+          setup-command: ". ./setenv.sh && ./.github/scripts/decrypt_answers.sh"
+          command: ". ./setenv.sh && ./.github/scripts/check_questions.sh 10"
+          timeout: 1
+          max-score: 1
+
+      - name: Autograding Reporter
+        uses: classroom-resources/autograding-grading-reporter@v1
+        env:
+          BUILD-DEBUG_RESULTS: "${{steps.build-debug.outputs.result}}"
+          SPOTLESS_RESULTS: "${{steps.spotless.outputs.result}}"
+          Q1_RESULTS: "${{steps.q1.outputs.result}}"
+          Q2_RESULTS: "${{steps.q2.outputs.result}}"
+          Q3_RESULTS: "${{steps.q3.outputs.result}}"
+          Q4_RESULTS: "${{steps.q4.outputs.result}}"
+          Q5_RESULTS: "${{steps.q5.outputs.result}}"
+          Q6_RESULTS: "${{steps.q6.outputs.result}}"
+          Q7_RESULTS: "${{steps.q7.outputs.result}}"
+          Q8_RESULTS: "${{steps.q8.outputs.result}}"
+          Q9_RESULTS: "${{steps.q9.outputs.result}}"
+          Q10_RESULTS: "${{steps.q10.outputs.result}}"
+        with:
+          runners: build-debug,spotless,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10

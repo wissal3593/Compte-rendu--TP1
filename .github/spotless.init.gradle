@@ -1,0 +1,40 @@
+// Load Spotless on the init script classpath (allowed)
+initscript {
+    repositories { gradlePluginPortal() }
+    dependencies { classpath("com.diffplug.spotless:spotless-plugin-gradle:8.1.0") }
+}
+
+allprojects {
+    apply plugin: com.diffplug.gradle.spotless.SpotlessPlugin
+    
+    spotless {
+        // Android/Kotlin projects
+        kotlin {
+            target("src/**/*.kt")
+            targetExclude("**/build/**", "src/test/**", "src/androidTest/**", "src/testFixtures/**")
+            ktlint().editorConfigOverride([
+                "android": "true",
+                "ktlint_standard_property-naming": "disabled"
+            ])
+        }
+        
+        // Java projects  
+        java {
+            target("src/**/*.java")
+            targetExclude("**/build/**", "src/test/**", "src/androidTest/**", "src/testFixtures/**")
+            googleJavaFormat().aosp()
+        }
+        
+        // Gradle files
+        kotlinGradle {
+            target("**/*.gradle.kts")
+            targetExclude("**/build/**")
+            ktlint()
+        }
+
+        // XML files
+        format("xml") {
+            target("**/*.xml")
+        }
+    }
+}
